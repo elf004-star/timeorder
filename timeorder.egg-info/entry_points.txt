@@ -1,0 +1,6 @@
+[console_scripts]
+add-status-column = add_status_column:main
+explore-data = explore_data:main
+predict-status = predict:main
+quick-start = quick_start:main
+train-model = train_model:main

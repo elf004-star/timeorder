@@ -1,0 +1,35 @@
+Metadata-Version: 2.4
+Name: timeorder
+Version: 0.1.0
+Summary: 井段状态预测机器学习系统 - 中石化竞赛
+Author-email: CCQ <1873475824@qq.com>
+License: MIT
+Keywords: machine-learning,well-status,prediction,oil-gas,lightgbm,data-processing
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: scikit-learn>=1.3.0
+Requires-Dist: lightgbm>=4.0.0
+Requires-Dist: matplotlib>=3.7.0
+Requires-Dist: seaborn>=0.12.0
+Requires-Dist: scipy>=1.11.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: black>=22.0; extra == "dev"
+Requires-Dist: flake8>=5.0; extra == "dev"
+Requires-Dist: mypy>=1.0; extra == "dev"
+Provides-Extra: ml
+Requires-Dist: jupyter>=1.0.0; extra == "ml"
+Requires-Dist: notebook>=7.0.0; extra == "ml"
+Requires-Dist: optuna>=3.0.0; extra == "ml"
+Requires-Dist: xgboost>=2.0.0; extra == "ml"
