@@ -29,9 +29,9 @@ def load_data(file_path: str) -> pd.DataFrame:
     print("="*60)
     df = pd.read_csv(file_path)
     
-    # 转换dy➗dx为数值类型
-    if 'dy➗dx' in df.columns:
-        df['dy➗dx'] = pd.to_numeric(df['dy➗dx'], errors='coerce')
+    # 转换Dogleg Severity为数值类型
+    if 'Dogleg Severity' in df.columns:
+        df['Dogleg Severity'] = pd.to_numeric(df['Dogleg Severity'], errors='coerce')
     
     print(f"\n数据文件: {file_path}")
     print(f"数据形状: {df.shape}")
@@ -103,14 +103,15 @@ def plot_status_distribution(df: pd.DataFrame):
     axes[0].bar(range(len(status_counts)), status_counts.values, color=['#3498db', '#e74c3c', '#2ecc71', '#f39c12'])
     axes[0].set_xticks(range(len(status_counts)))
     axes[0].set_xticklabels([status_labels[i] for i in status_counts.index])
-    axes[0].set_ylabel('Number of Data Points', fontsize=12)
-    axes[0].set_title('Overall Status Distribution', fontsize=14, fontweight='bold')
+    axes[0].set_ylabel('Number of Data Points', fontsize=18)
+    axes[0].set_title('Overall Status Distribution', fontsize=19, fontweight='bold')
     axes[0].grid(axis='y', alpha=0.3)
+    axes[0].tick_params(axis='both', labelsize=18)
     
     # Add value labels
     for i, v in enumerate(status_counts.values):
         axes[0].text(i, v + max(status_counts.values)*0.01, str(v), 
-                    ha='center', va='bottom', fontweight='bold')
+                    ha='center', va='bottom', fontweight='bold', fontsize=18)
     
     # 2. Status distribution per well
     well_status = df.groupby(['转换后JH', 'status']).size().unstack(fill_value=0)
@@ -120,12 +121,13 @@ def plot_status_distribution(df: pd.DataFrame):
     well_status_pct_top10 = well_status_pct.head(10)
     well_status_pct_top10.plot(kind='bar', stacked=True, ax=axes[1],
                                color=['#3498db', '#e74c3c', '#2ecc71', '#f39c12'])
-    axes[1].set_ylabel('Percentage (%)', fontsize=12)
-    axes[1].set_xlabel('Well ID', fontsize=12)
-    axes[1].set_title('Status Distribution by Well (Top 10)', fontsize=14, fontweight='bold')
+    axes[1].set_ylabel('Percentage (%)', fontsize=18)
+    axes[1].set_xlabel('Well ID', fontsize=18)
+    axes[1].set_title('Status Distribution by Well (Top 10)', fontsize=19, fontweight='bold')
     axes[1].legend(['Vertical(0)', 'Build-up(1)', 'Hold(2)', 'Drop-off(3)'], 
-                   loc='upper right', fontsize=9)
-    axes[1].tick_params(axis='x', rotation=45)
+                   loc='upper right', fontsize=14)
+    axes[1].tick_params(axis='x', rotation=45, labelsize=18)
+    axes[1].tick_params(axis='y', labelsize=18)
     
     plt.tight_layout()
     plt.savefig('status_distribution.png', dpi=300, bbox_inches='tight')
@@ -136,23 +138,25 @@ def plot_feature_distributions(df: pd.DataFrame):
     """Plot feature distributions"""
     # Ensure correct data types
     df_plot = df.copy()
-    df_plot['dy➗dx'] = pd.to_numeric(df_plot['dy➗dx'], errors='coerce')
+    df_plot['Dogleg Severity'] = pd.to_numeric(df_plot['Dogleg Severity'], errors='coerce')
     
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
     # 1. Inclination angle distribution
     axes[0, 0].hist(df_plot['JX'].dropna(), bins=50, color='#3498db', alpha=0.7, edgecolor='black')
-    axes[0, 0].set_xlabel('Inclination Angle (degree)', fontsize=12)
-    axes[0, 0].set_ylabel('Frequency', fontsize=12)
-    axes[0, 0].set_title('Distribution of Inclination Angle', fontsize=13, fontweight='bold')
+    axes[0, 0].set_xlabel('Inclination Angle (degree)', fontsize=20)
+    axes[0, 0].set_ylabel('Frequency', fontsize=20)
+    axes[0, 0].set_title('Distribution of Inclination Angle', fontsize=22, fontweight='bold')
     axes[0, 0].grid(alpha=0.3)
+    axes[0, 0].tick_params(axis='both', labelsize=20)
     
-    # 2. dy/dx distribution
-    axes[0, 1].hist(df_plot['dy➗dx'].dropna(), bins=50, color='#e74c3c', alpha=0.7, edgecolor='black')
-    axes[0, 1].set_xlabel('dy/dx', fontsize=12)
-    axes[0, 1].set_ylabel('Frequency', fontsize=12)
-    axes[0, 1].set_title('Distribution of dy/dx', fontsize=13, fontweight='bold')
+    # 2. Dogleg Severity distribution
+    axes[0, 1].hist(df_plot['Dogleg Severity'].dropna(), bins=50, color='#e74c3c', alpha=0.7, edgecolor='black')
+    axes[0, 1].set_xlabel('Dogleg Severity', fontsize=20)
+    axes[0, 1].set_ylabel('Frequency', fontsize=20)
+    axes[0, 1].set_title('Distribution of Dogleg Severity', fontsize=22, fontweight='bold')
     axes[0, 1].grid(alpha=0.3)
+    axes[0, 1].tick_params(axis='both', labelsize=20)
     
     # 3. Inclination angle by Status boxplot
     if 'status' in df_plot.columns:
@@ -165,19 +169,21 @@ def plot_feature_distributions(df: pd.DataFrame):
         sns.boxplot(data=df_plot, x='status_label', y='JX', ax=axes[1, 0], 
                    hue='status_label', palette=['#3498db', '#e74c3c', '#2ecc71', '#f39c12'], 
                    legend=False)
-        axes[1, 0].set_xlabel('Status', fontsize=12)
-        axes[1, 0].set_ylabel('Inclination Angle (degree)', fontsize=12)
-        axes[1, 0].set_title('Inclination Angle by Status', fontsize=13, fontweight='bold')
+        axes[1, 0].set_xlabel('Status', fontsize=20)
+        axes[1, 0].set_ylabel('Inclination Angle (degree)', fontsize=20)
+        axes[1, 0].set_title('Inclination Angle by Status', fontsize=22, fontweight='bold')
         axes[1, 0].grid(alpha=0.3)
+        axes[1, 0].tick_params(axis='both', labelsize=20)
         
-        # 4. dy/dx by Status boxplot
-        sns.boxplot(data=df_plot, x='status_label', y='dy➗dx', ax=axes[1, 1],
+        # 4. Dogleg Severity by Status boxplot
+        sns.boxplot(data=df_plot, x='status_label', y='Dogleg Severity', ax=axes[1, 1],
                    hue='status_label', palette=['#3498db', '#e74c3c', '#2ecc71', '#f39c12'], 
                    legend=False)
-        axes[1, 1].set_xlabel('Status', fontsize=12)
-        axes[1, 1].set_ylabel('dy/dx', fontsize=12)
-        axes[1, 1].set_title('dy/dx by Status', fontsize=13, fontweight='bold')
+        axes[1, 1].set_xlabel('Status', fontsize=20)
+        axes[1, 1].set_ylabel('Dogleg Severity', fontsize=20)
+        axes[1, 1].set_title('Dogleg Severity by Status', fontsize=22, fontweight='bold')
         axes[1, 1].grid(alpha=0.3)
+        axes[1, 1].tick_params(axis='both', labelsize=20)
     
     plt.tight_layout()
     plt.savefig('feature_distributions.png', dpi=300, bbox_inches='tight')
@@ -202,22 +208,24 @@ def plot_well_trajectory(df: pd.DataFrame, well_name: str = None, n_wells: int =
         well_data = df[df['转换后JH'] == well].copy().sort_values('序号')
         
         # Ensure numeric types
-        well_data['dy➗dx'] = pd.to_numeric(well_data['dy➗dx'], errors='coerce')
+        well_data['Dogleg Severity'] = pd.to_numeric(well_data['Dogleg Severity'], errors='coerce')
         
         # 1. Inclination angle curve
         axes[idx, 0].plot(well_data['序号'], well_data['JX'], 'b-', linewidth=2)
-        axes[idx, 0].set_xlabel('Index', fontsize=11)
-        axes[idx, 0].set_ylabel('Inclination Angle (degree)', fontsize=11)
-        axes[idx, 0].set_title(f'Well: {well} - Inclination Angle', fontsize=12, fontweight='bold')
+        axes[idx, 0].set_xlabel('Index', fontsize=22)
+        axes[idx, 0].set_ylabel('Inclination Angle (degree)', fontsize=22)
+        axes[idx, 0].set_title(f'Well: {well} - Inclination Angle', fontsize=24, fontweight='bold')
         axes[idx, 0].grid(alpha=0.3)
+        axes[idx, 0].tick_params(axis='both', labelsize=22)
         
-        # 2. dy/dx curve
-        axes[idx, 1].plot(well_data['序号'], well_data['dy➗dx'], 'g-', linewidth=2)
+        # 2. Dogleg Severity curve
+        axes[idx, 1].plot(well_data['序号'], well_data['Dogleg Severity'], 'g-', linewidth=2)
         axes[idx, 1].axhline(y=0, color='r', linestyle='--', alpha=0.5)
-        axes[idx, 1].set_xlabel('Index', fontsize=11)
-        axes[idx, 1].set_ylabel('dy/dx', fontsize=11)
-        axes[idx, 1].set_title(f'Well: {well} - dy/dx', fontsize=12, fontweight='bold')
+        axes[idx, 1].set_xlabel('Index', fontsize=22)
+        axes[idx, 1].set_ylabel('Dogleg Severity', fontsize=22)
+        axes[idx, 1].set_title('Dogleg Severity', fontsize=24, fontweight='bold')
         axes[idx, 1].grid(alpha=0.3)
+        axes[idx, 1].tick_params(axis='both', labelsize=22)
         
         # 3. Status curve
         if 'status' in well_data.columns:
@@ -233,13 +241,14 @@ def plot_well_trajectory(df: pd.DataFrame, well_name: str = None, n_wells: int =
             
             axes[idx, 2].plot(well_data['序号'], well_data['status'], 'k-', 
                             linewidth=1.5, alpha=0.5)
-            axes[idx, 2].set_xlabel('Index', fontsize=11)
-            axes[idx, 2].set_ylabel('Status', fontsize=11)
-            axes[idx, 2].set_title(f'Well: {well} - Wellbore Status', fontsize=12, fontweight='bold')
+            axes[idx, 2].set_xlabel('Index', fontsize=22)
+            axes[idx, 2].set_ylabel('Status', fontsize=22)
+            axes[idx, 2].set_title('Wellbore Status', fontsize=24, fontweight='bold')
             axes[idx, 2].set_yticks([0, 1, 2, 3])
-            axes[idx, 2].set_yticklabels(['Vertical', 'Build-up', 'Hold', 'Drop-off'])
-            axes[idx, 2].legend(loc='best', fontsize=9)
+            axes[idx, 2].set_yticklabels(['Vertical', 'Build-up', 'Hold', 'Drop-off'], fontsize=22)
+            axes[idx, 2].legend(loc='best', fontsize=18)
             axes[idx, 2].grid(alpha=0.3)
+            axes[idx, 2].tick_params(axis='x', labelsize=22)
     
     plt.tight_layout()
     filename = 'well_trajectories.png'
@@ -309,9 +318,9 @@ def correlation_analysis(df: pd.DataFrame):
     
     # Select numeric columns and ensure numeric types
     df_numeric = df.copy()
-    df_numeric['dy/dx'] = pd.to_numeric(df_numeric['dy➗dx'], errors='coerce')
+    df_numeric['Dogleg Severity'] = pd.to_numeric(df_numeric['Dogleg Severity'], errors='coerce')
     
-    numeric_cols = ['JX', 'dy/dx']
+    numeric_cols = ['JX', 'Dogleg Severity']
     if 'status' in df.columns:
         numeric_cols.append('status')
     

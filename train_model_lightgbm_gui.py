@@ -5,7 +5,8 @@
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler, LabelEncoder, RobustScaler
+from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
 import lightgbm as lgb
 import matplotlib.pyplot as plt
@@ -34,7 +35,7 @@ class WellStatusPredictor:
     
     def __init__(self):
         self.model = None
-        self.scaler = StandardScaler()
+        self.scaler = RobustScaler()
         self.feature_columns = []
     
     def load_model(self, model_path: str):
@@ -70,7 +71,7 @@ class WellStatusPredictor:
             
             # 基础特征 - 确保数值类型
             group['JX'] = pd.to_numeric(group['JX'], errors='coerce').fillna(0)
-            group['dy_dx'] = pd.to_numeric(group['dy➗dx'], errors='coerce').fillna(0)
+            group['dy_dx'] = pd.to_numeric(group['Dogleg Severity'], errors='coerce').fillna(0)
             
             # 1. 滑动窗口统计特征（窗口大小：3, 5, 10）
             for window in [3, 5, 10]:
@@ -156,7 +157,7 @@ class WellStatusPredictor:
         print(f"验证集: {len(val_df)} 样本 ({len(val_wells)} 口井)")
         
         # 提取特征和标签
-        exclude_cols = ['序号', '转换后JH', 'status', 'dy➗dx']
+        exclude_cols = ['序号', '转换后JH', 'status', 'Dogleg Severity']
         self.feature_columns = [col for col in train_df.columns if col not in exclude_cols]
         
         X_train = train_df[self.feature_columns].values
@@ -169,8 +170,38 @@ class WellStatusPredictor:
         X_train = self.scaler.fit_transform(X_train)
         X_val = self.scaler.transform(X_val)
         
-        return (X_train, y_train), (X_val, y_val), val_df
+        return (X_train, y_train), (X_val, y_val), train_df, val_df
     
+    def save_results_by_well(self, df: pd.DataFrame, origin_predictions: np.ndarray, corrected_predictions: np.ndarray, output_dir: str):
+        """保存预测结果，按井号分文件"""
+        import os
+        
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            
+        # Add prediction to a copy of df
+        result_df = df.copy()
+        result_df['origin_status_predict'] = origin_predictions
+        result_df['status_predict'] = corrected_predictions
+        
+        # Keep only required columns
+        required_cols = ['序号', '转换后JH', 'JX', 'Dogleg Severity', 'status', 'origin_status_predict', 'status_predict']
+        # Check if columns exist
+        available_cols = [col for col in required_cols if col in result_df.columns]
+        
+        result_df = result_df[available_cols]
+        
+        # Save by well
+        count = 0
+        for well_name, group in result_df.groupby('转换后JH'):
+            # Clean filename
+            safe_name = str(well_name).replace('/', '_').replace('\\', '_')
+            file_path = os.path.join(output_dir, f"{safe_name}.csv")
+            group.to_csv(file_path, index=False, encoding='utf-8-sig')
+            count += 1
+            
+        print(f"已保存 {count} 个井的文件到 {output_dir}")
+
     def train(self, X_train: np.ndarray, y_train: np.ndarray,
               X_val: np.ndarray, y_val: np.ndarray, params: Dict,
               callback=None) -> Dict:
@@ -179,8 +210,11 @@ class WellStatusPredictor:
         """
         print("\n开始训练模型...")
         
-        # 创建数据集
-        train_data = lgb.Dataset(X_train, label=y_train)
+        # 创建数据集 (处理类别不平衡)
+        print("计算样本权重以处理类别不平衡...")
+        sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
+        
+        train_data = lgb.Dataset(X_train, label=y_train, weight=sample_weights)
         val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
         
         # 训练历史记录
@@ -225,37 +259,126 @@ class WellStatusPredictor:
         y_pred_proba = self.model.predict(X, num_iteration=self.model.best_iteration)
         return np.argmax(y_pred_proba, axis=1)
     
-    def apply_rules(self, df: pd.DataFrame, predictions: np.ndarray) -> np.ndarray:
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """获取预测概率"""
+        return self.model.predict(X, num_iteration=self.model.best_iteration)
+    
+    def apply_rules(self, df: pd.DataFrame, predictions: np.ndarray, prediction_proba: np.ndarray = None) -> np.ndarray:
         """
-        应用后处理规则：确保状态转换的单向性
+        应用后处理规则：
+        1. 当一口井最大状态是2的时候，即使预测的是3，也当作2处理 (仅当有真实标签时)
+        2. 确保状态转换的单向性 (0 -> 1 -> 2 -> 3)，使用最小修改算法
+        3. 如果修改次数相同，优先修改置信度低的地方
         """
         print("\n应用后处理规则...")
+        
+        # 创建副本以避免修改原始数据
+        temp_df = df.copy()
+        
+        # 必须确保temp_df和predictions是对齐的
+        # 添加一个0..N的索引列，用于后续将结果放回数组的正确位置
+        temp_df['__row_idx__'] = range(len(temp_df))
+        temp_df['__pred__'] = predictions
+        
+        # 如果没有提供概率，使用默认置信度（所有位置相等）
+        if prediction_proba is None:
+            # 使用预测值作为置信度的简单代理（实际应该用概率）
+            confidence = np.ones(len(predictions))
+        else:
+            # 使用预测类别的概率作为置信度
+            confidence = np.max(prediction_proba, axis=1)
+        
+        temp_df['__confidence__'] = confidence
         
         corrected_predictions = predictions.copy()
         
         # 按井号分组处理
-        start_idx = 0
-        for well_name, group in df.groupby('转换后JH'):
-            end_idx = start_idx + len(group)
-            well_pred = predictions[start_idx:end_idx]
+        for well_name, group in temp_df.groupby('转换后JH'):
+            # 获取该组在原始数组中的索引位置
+            indices = group['__row_idx__'].values
+            preds = group['__pred__'].values.copy()
+            confidences = group['__confidence__'].values.copy()
             
-            # 强制单向性：0 -> 1 -> 2 -> 3
-            corrected = []
-            current_max = 0
+            # 规则1: 如果真实最大状态为2，则将预测的3改为2
+            # 只有当DataFrame包含'status'列时才能应用此规则
+            if 'status' in group.columns:
+                max_status = group['status'].max()
+                if max_status == 2:
+                    preds[preds == 3] = 2
             
-            for pred in well_pred:
-                if pred >= current_max:
-                    current_max = pred
-                corrected.append(current_max)
+            # 规则2: 使用最小修改算法确保单向性 0 -> 1 -> 2 -> 3
+            corrected = self._minimize_modifications(preds, confidences)
             
-            corrected_predictions[start_idx:end_idx] = corrected
-            start_idx = end_idx
+            # 将修正后的结果放回对应位置
+            corrected_predictions[indices] = corrected
         
         # 统计修正的数量
         n_corrected = np.sum(predictions != corrected_predictions)
         print(f"修正了 {n_corrected} 个预测 ({n_corrected/len(predictions)*100:.2f}%)")
         
         return corrected_predictions
+    
+    def _minimize_modifications(self, preds: np.ndarray, confidences: np.ndarray) -> np.ndarray:
+        """
+        找到最小修改方案，使序列单调递增（0 -> 1 -> 2 -> 3）
+        如果修改次数相同，优先修改置信度低的地方
+        
+        使用动态规划算法
+        """
+        n = len(preds)
+        if n == 0:
+            return preds
+        
+        # 状态：dp[i][s] = 到位置i，状态为s的最小修改代价
+        # s可以是0,1,2,3
+        # 代价 = 修改次数 + (1 - 置信度) * 0.1（置信度低的优先修改）
+        
+        dp = np.full((n, 4), np.inf)
+        parent = np.full((n, 4), -1, dtype=int)
+        
+        # 初始化：第一个位置
+        for s in range(4):
+            if preds[0] == s:
+                cost = 0  # 不需要修改
+            else:
+                cost = 1 + (1 - confidences[0]) * 0.1  # 修改代价
+            dp[0][s] = cost
+        
+        # 动态规划
+        for i in range(1, n):
+            for s in range(4):
+                # 当前状态必须是s，且必须 >= 前一个位置的状态
+                min_cost = np.inf
+                best_prev = -1
+                
+                for prev_s in range(s + 1):  # 前一个状态可以是0到s
+                    prev_cost = dp[i-1][prev_s]
+                    if prev_cost == np.inf:
+                        continue
+                    
+                    # 计算修改代价
+                    if preds[i] == s:
+                        modify_cost = 0
+                    else:
+                        modify_cost = 1 + (1 - confidences[i]) * 0.1
+                    
+                    total_cost = prev_cost + modify_cost
+                    if total_cost < min_cost:
+                        min_cost = total_cost
+                        best_prev = prev_s
+                
+                dp[i][s] = min_cost
+                parent[i][s] = best_prev
+        
+        # 回溯找到最优路径
+        best_final_state = np.argmin(dp[n-1])
+        result = np.zeros(n, dtype=int)
+        result[n-1] = best_final_state
+        
+        for i in range(n-2, -1, -1):
+            result[i] = parent[i+1][result[i+1]]
+        
+        return result
     
     def evaluate(self, y_true: np.ndarray, y_pred: np.ndarray, 
                  y_pred_corrected: np.ndarray = None) -> Dict:
@@ -637,9 +760,9 @@ class TrainingGUI:
             
             df = pd.read_csv(self.file_var.get())
             
-            # 转换dy➗dx为数值类型
-            if 'dy➗dx' in df.columns:
-                df['dy➗dx'] = pd.to_numeric(df['dy➗dx'], errors='coerce')
+            # 转换Dogleg Severity为数值类型
+            if 'Dogleg Severity' in df.columns:
+                df['Dogleg Severity'] = pd.to_numeric(df['Dogleg Severity'], errors='coerce')
             
             self.log(f"数据形状: {df.shape}")
             self.log(f"\nStatus分布:")
@@ -657,7 +780,7 @@ class TrainingGUI:
             self.status_var.set("准备数据中...")
             val_size = self.val_size_var.get()
             
-            (X_train, y_train), (X_val, y_val), val_df = \
+            (X_train, y_train), (X_val, y_val), train_df, val_df = \
                 self.predictor.prepare_data(df_with_features, val_size=val_size)
             
             self.log(f"训练集样本数: {len(X_train)}")
@@ -698,8 +821,9 @@ class TrainingGUI:
             self.log("\n5. 验证集评估...")
             self.status_var.set("评估中...")
             
-            y_val_pred = self.predictor.predict(X_val)
-            y_val_pred_corrected = self.predictor.apply_rules(val_df, y_val_pred)
+            y_val_pred_proba = self.predictor.predict_proba(X_val)
+            y_val_pred = np.argmax(y_val_pred_proba, axis=1)
+            y_val_pred_corrected = self.predictor.apply_rules(val_df, y_val_pred, y_val_pred_proba)
             val_results = self.predictor.evaluate(y_val, y_val_pred, y_val_pred_corrected)
             
             # 显示结果
@@ -718,8 +842,26 @@ class TrainingGUI:
             
             self.result_text.insert(tk.END, result_text)
             
+            # 6. 保存中间结果
+            self.log("\n6. 保存中间结果...")
+            self.status_var.set("保存中间结果...")
+            
+            # Predict on training set
+            y_train_pred_proba = self.predictor.predict_proba(X_train)
+            y_train_pred = np.argmax(y_train_pred_proba, axis=1)
+            y_train_pred_corrected = self.predictor.apply_rules(train_df, y_train_pred, y_train_pred_proba)
+            
+            # Define memory directory
+            base_dir = os.path.dirname(self.file_var.get()) if self.file_var.get() else os.getcwd()
+            memory_dir = os.path.join(base_dir, "memory_light")
+            
+            self.predictor.save_results_by_well(train_df, y_train_pred, y_train_pred_corrected, os.path.join(memory_dir, "train"))
+            self.predictor.save_results_by_well(val_df, y_val_pred, y_val_pred_corrected, os.path.join(memory_dir, "test"))
+            
+            self.log(f"中间结果已保存到 {memory_dir}")
+
             # 7. 保存模型
-            self.log("\n6. 保存模型...")
+            self.log("\n7. 保存模型...")
             self.predictor.save_model(params=params)
             
             self.log("\n" + "="*60)
@@ -800,14 +942,14 @@ class TrainingGUI:
             self.log(f"   数据形状: {df.shape}")
             
             # 检查必需的列
-            required_cols = ['序号', '转换后JH', 'JX', 'dy➗dx']
+            required_cols = ['序号', '转换后JH', 'JX', 'Dogleg Severity']
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 raise ValueError(f"数据文件缺少必需的列: {missing_cols}")
             
             # 转换数据类型
-            if 'dy➗dx' in df.columns:
-                df['dy➗dx'] = pd.to_numeric(df['dy➗dx'], errors='coerce')
+            if 'Dogleg Severity' in df.columns:
+                df['Dogleg Severity'] = pd.to_numeric(df['Dogleg Severity'], errors='coerce')
             
             self.log(f"   井号数量: {df['转换后JH'].nunique()}")
             
@@ -837,20 +979,29 @@ class TrainingGUI:
             
             # 5. 预测
             self.log("\n5. 执行预测...")
-            y_pred = self.predictor.predict(X_pred)
+            y_pred_proba = self.predictor.predict_proba(X_pred)
+            y_pred = np.argmax(y_pred_proba, axis=1)
             self.log(f"   ✓ 预测完成")
             
             # 6. 应用规则修正
             self.log("\n6. 应用后处理规则...")
-            y_pred_corrected = self.predictor.apply_rules(df_with_features, y_pred)
+            y_pred_corrected = self.predictor.apply_rules(df_with_features, y_pred, y_pred_proba)
             
             # 7. 保存结果
             self.log("\n7. 保存预测结果...")
-            result_df = df[['序号', '转换后JH', 'JX', 'dy➗dx']].copy()
+            result_df = df[['序号', '转换后JH', 'JX', 'Dogleg Severity']].copy()
+            result_df['origin_status_predict'] = y_pred
             result_df['status_predict'] = y_pred_corrected
             
             result_df.to_csv(output_path, index=False, encoding='utf-8-sig')
             self.log(f"   ✓ 结果已保存到: {output_path}")
+            
+            # 7.5 保存分井结果
+            self.log("\n7.5 保存分井结果...")
+            data_dir = os.path.dirname(data_path) if data_path else os.getcwd()
+            predict_dir = os.path.join(data_dir, "predict_light")
+            self.predictor.save_results_by_well(df, y_pred, y_pred_corrected, predict_dir)
+            self.log(f"   ✓ 分井结果已保存到: {predict_dir}")
             
             # 显示预测结果统计
             self.log("\n预测结果统计:")

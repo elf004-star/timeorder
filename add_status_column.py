@@ -54,7 +54,7 @@ def add_status_column(input_file, output_file):
 
 if __name__ == "__main__":
     # 处理文件
-    input_file = "data.csv"
+    input_file = "data/data_with_dogleg.csv"
     output_file = "data_with_status.csv"
     
     try:

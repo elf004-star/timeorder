@@ -2,3 +2,5 @@
 /build
 /Models
 /__pycache__
+/data
+/memory
