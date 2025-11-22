@@ -3,9 +3,8 @@
 /Models
 /__pycache__
 /data
-/memory
 
-*memory*/
+/*memory*
 
 *.csv
 
