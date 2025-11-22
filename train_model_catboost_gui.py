@@ -11,10 +11,13 @@ import catboost as cb
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib.ticker import MaxNLocator
 import seaborn as sns
 from typing import Tuple, Dict
 import warnings
 warnings.filterwarnings('ignore')
+from scipy.signal import savgol_filter
+from scipy import stats
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -38,6 +41,12 @@ class WellStatusPredictor:
         self.model = None
         self.scaler = RobustScaler()
         self.feature_columns = []
+        # 默认预处理参数
+        self.preprocessing_params = {
+            'method': 'none',      # none, rolling, savgol
+            'window_size': 5,
+            'poly_order': 2
+        }
     
     def load_model(self, model_path: str):
         """加载已训练的模型及相关配置"""
@@ -58,15 +67,23 @@ class WellStatusPredictor:
                 data = pickle.load(f)
                 self.scaler = data['scaler']
                 self.feature_columns = data['feature_columns']
-            print(f"Scaler已加载: {scaler_path}")
+                # 加载预处理参数，如果不存在则使用默认值
+                self.preprocessing_params = data.get('preprocessing_params', {
+                    'method': 'none',
+                    'window_size': 5,
+                    'poly_order': 2
+                })
+            print(f"配置已加载: {scaler_path}")
+            print(f"预处理参数: {self.preprocessing_params}")
         else:
-            print(f"警告: 未找到scaler文件 {scaler_path}，预测可能不准确")
+            print(f"警告: 未找到配置文件 {scaler_path}，预测可能不准确")
         
     def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        特征工程：为每口井创建时序特征
+        特征工程：为每口井创建时序特征 (共28个推荐特征)
         """
         print("开始特征工程...")
+        print(f"使用预处理参数: {self.preprocessing_params}")
         
         # 按井号分组处理
         features_list = []
@@ -74,59 +91,240 @@ class WellStatusPredictor:
         for well_name, group in df.groupby('转换后JH'):
             group = group.copy().sort_values('序号').reset_index(drop=True)
             
-            # 基础特征 - 确保数值类型
+            # 确保基础列存在且为数值
             group['JX'] = pd.to_numeric(group['JX'], errors='coerce').fillna(0)
-            group['dy_dx'] = pd.to_numeric(group['Dogleg Severity'], errors='coerce').fillna(0)
+            if 'Dogleg Severity' in group.columns:
+                group['dogl'] = pd.to_numeric(group['Dogleg Severity'], errors='coerce').fillna(0)
+            else:
+                group['dogl'] = 0
             
-            # 1. 滑动窗口统计特征（窗口大小：3, 5, 10）
-            for window in [3, 5, 10]:
-                # JX的统计特征
-                group[f'JX_mean_{window}'] = group['JX'].rolling(window=window, min_periods=1).mean()
-                group[f'JX_std_{window}'] = group['JX'].rolling(window=window, min_periods=1).std().fillna(0)
-                group[f'JX_max_{window}'] = group['JX'].rolling(window=window, min_periods=1).max()
-                group[f'JX_min_{window}'] = group['JX'].rolling(window=window, min_periods=1).min()
-                
-                # dy/dx的统计特征
-                group[f'dy_dx_mean_{window}'] = group['dy_dx'].rolling(window=window, min_periods=1).mean()
-                group[f'dy_dx_std_{window}'] = group['dy_dx'].rolling(window=window, min_periods=1).std().fillna(0)
-                group[f'dy_dx_max_{window}'] = group['dy_dx'].rolling(window=window, min_periods=1).max()
-                group[f'dy_dx_min_{window}'] = group['dy_dx'].rolling(window=window, min_periods=1).min()
+            # ==========================================
+            # 1. 数据去噪 (Smoothing)
+            # ==========================================
+            raw_jx = group['JX'].values
+            smoothed_jx = raw_jx.copy()
             
-            # 2. 滞后特征（前N个点的值）
-            for lag in [1, 2, 3, 5]:
-                group[f'JX_lag_{lag}'] = group['JX'].shift(lag).fillna(0)
-                group[f'dy_dx_lag_{lag}'] = group['dy_dx'].shift(lag).fillna(0)
+            method = self.preprocessing_params.get('method', 'none')
+            window = int(self.preprocessing_params.get('window_size', 5))
+            poly = int(self.preprocessing_params.get('poly_order', 2))
             
-            # 3. 差分特征
-            group['JX_diff_1'] = group['JX'].diff().fillna(0)
-            group['JX_diff_2'] = group['JX'].diff(2).fillna(0)
-            group['dy_dx_diff_1'] = group['dy_dx'].diff().fillna(0)
+            if len(group) >= window:
+                if method == 'rolling':
+                    # 移动平均 (Center=True保持相位)
+                    smoothed_jx = pd.Series(raw_jx).rolling(window=window, center=True, min_periods=1).mean().values
+                elif method == 'savgol':
+                    # Savitzky-Golay 滤波器
+                    try:
+                        if window % 2 == 0: window += 1 # SG要求窗口为奇数
+                        if window > len(group): window = len(group) if len(group) % 2 != 0 else len(group) - 1
+                        if window > poly:
+                            smoothed_jx = savgol_filter(raw_jx, window, poly)
+                    except Exception as e:
+                        print(f"SG Filter error for well {well_name}: {e}")
             
-            # 4. 累积特征
-            group['JX_cumsum'] = group['JX'].cumsum()
-            group['dy_dx_cumsum'] = group['dy_dx'].cumsum()
+            # 使用平滑后的数据进行特征计算
+            # 注意：后续特征计算基于 smoothed_jx，但为了保留原始信息，可以保留raw列
+            group['JX_smooth'] = smoothed_jx
+            # 用平滑后的值替换原值进行计算（或者新建一列，这里根据需求主要用平滑后的分析趋势）
+            # 题目要求：在提取特征前，必须进行两步操作。所以我们基于 JX_smooth 计算特征
+            s_series = pd.Series(smoothed_jx) 
             
-            # 5. 位置特征
-            group['depth_position'] = np.arange(len(group)) / len(group)  # 相对深度位置
-            group['depth_from_start'] = np.arange(len(group))  # 从井口的距离
+            # 辅助函数：计算滚动斜率 (提前定义)
+            def calc_slope(x):
+                if len(x) < 2: return 0
+                return np.polyfit(np.arange(len(x)), x, 1)[0]
             
-            # 6. 领域知识特征
-            group['JX_abs'] = group['JX'].abs()
-            group['dy_dx_abs'] = group['dy_dx'].abs()
-            group['is_stable'] = (group['dy_dx_abs'] < 0.01).astype(int)  # 井斜角是否稳定
-            group['is_increasing'] = (group['dy_dx'] > 0.02).astype(int)  # 是否在造斜
-            group['is_decreasing'] = (group['dy_dx'] < -0.01).astype(int)  # 是否在降斜
+            # ==========================================
+            # 1.5 构建 dogl_s 及其特征
+            # ==========================================
+            # 使用平滑后的JX判断趋势
+            jx_next = s_series.shift(-1)
             
-            # 7. 趋势特征（最近N个点的趋势）
-            for window in [3, 5]:
-                group[f'JX_trend_{window}'] = group['JX'].rolling(window=window, min_periods=1).apply(
-                    lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) > 1 else 0
-                ).fillna(0)
+            # 判断符号: 下一点 >= 当前点 => 1 (增加/不变), 下一点 < 当前点 => -1 (减少)
+            # 使用np.where处理
+            signs = np.where(jx_next < s_series, -1, 1)
+            
+            group['dogl_s'] = group['dogl'] * signs
+            
+            # 最后一个点沿用上一个点的dogl_s
+            if len(group) > 1:
+                group.loc[group.index[-1], 'dogl_s'] = group.loc[group.index[-2], 'dogl_s']
+            
+            # dogl_s 的 6个时序特征
+            # 1. dogl_s_mean_5
+            group['dogl_s_mean_5'] = group['dogl_s'].rolling(window=5, min_periods=1).mean()
+            # 2. dogl_s_std_5
+            group['dogl_s_std_5'] = group['dogl_s'].rolling(window=5, min_periods=1).std().fillna(0)
+            # 3. dogl_s_trend_5 (Slope)
+            group['dogl_s_trend_5'] = group['dogl_s'].rolling(window=5, min_periods=2).apply(calc_slope).fillna(0)
+            # 4. dogl_s_diff_1
+            group['dogl_s_diff_1'] = group['dogl_s'].diff().fillna(0)
+            # 5. dogl_s_cumsum
+            group['dogl_s_cumsum'] = group['dogl_s'].cumsum()
+            # 6. dogl_s_lag_1
+            group['dogl_s_lag_1'] = group['dogl_s'].shift(1).fillna(0)
+            
+            # ==========================================
+            # 2. 组内归一化 (Group-wise Normalization)
+            # ==========================================
+            g_min = s_series.min()
+            g_max = s_series.max()
+            g_range = g_max - g_min if (g_max - g_min) > 1e-6 else 1.0
+            
+            # 第一类：位置与状态特征 (5个)
+            # 1. norm_value
+            group['norm_value'] = (s_series - g_min) / g_range
+            
+            # 2. rel_pos
+            group['rel_pos'] = (group.index + 1) / len(group)
+            
+            # 3. dist_to_max
+            group['dist_to_max'] = g_max - s_series
+            
+            # 4. is_max_region (是否大于组内最大值的95%)
+            group['is_max_region'] = (s_series > (g_min + 0.95 * g_range)).astype(int)
+            
+            # 5. accum_ratio (当前累计和占总和的比例)
+            group['accum_ratio'] = s_series.cumsum() / (s_series.sum() + 1e-6)
+            
+            # ==========================================
+            # 第二类：速度与趋势特征 (一阶导数相关) (8个)
+            # ==========================================
+            
+            # 6. diff_1
+            group['diff_1'] = s_series.diff().fillna(0)
+            
+            # 7. diff_3
+            group['diff_3'] = s_series.diff(3).fillna(0)
+            
+            # 8. trend_slope_5
+            group['trend_slope_5'] = s_series.rolling(5, min_periods=2).apply(calc_slope).fillna(0)
+            
+            # 9. trend_slope_10
+            group['trend_slope_10'] = s_series.rolling(10, min_periods=2).apply(calc_slope).fillna(0)
+            
+            # 10. ema_divergence (当前值 - EMA)
+            ema = s_series.ewm(span=10, adjust=False).mean()
+            group['ema_divergence'] = s_series - ema
+            
+            # 11. pct_change
+            group['pct_change'] = s_series.pct_change().fillna(0).replace([np.inf, -np.inf], 0)
+            
+            # 12 & 13. consecutive_up/down (连续上升/下降)
+            # 这是一个比较耗时的操作，使用向量化方法近似
+            diff = group['diff_1']
+            
+            # 识别上升(+1)和下降(-1)
+            direction = np.sign(diff)
+            
+            # 计算连续上升
+            # 利用groupby和小技巧
+            up_groups = (direction <= 0).cumsum()
+            group['consecutive_up'] = group.groupby(up_groups).cumcount()
+            # 修正：如果当前不是上升，置为0
+            group.loc[direction <= 0, 'consecutive_up'] = 0
+            
+            # 计算连续下降
+            down_groups = (direction >= 0).cumsum()
+            group['consecutive_down'] = group.groupby(down_groups).cumcount()
+            group.loc[direction >= 0, 'consecutive_down'] = 0
+            
+            # ==========================================
+            # 第三类：拐点与加速度特征 (二阶导数相关) (7个)
+            # ==========================================
+            
+            # 14. diff_2
+            group['diff_2'] = group['diff_1'].diff().fillna(0)
+            
+            # 15. slope_change
+            group['slope_change'] = group['trend_slope_5'].diff().fillna(0)
+            
+            # 16. curvature (局部曲率 - 简化版：三点计算)
+            # k = |x''| / (1 + x'^2)^(3/2)
+            # 这里x是index，y是值。x' = diff_1, x'' = diff_2
+            # 假设dx=1
+            group['curvature'] = group['diff_2'].abs() / ((1 + group['diff_1']**2)**1.5)
+            group['curvature'] = group['curvature'].fillna(0)
+            
+            # 17. peak_accel_loc (窗口内是否是二阶导数的最大值点 - 窗口5)
+            roll_max_acc = group['diff_2'].abs().rolling(5, center=True, min_periods=1).max()
+            group['peak_accel_loc'] = (group['diff_2'].abs() == roll_max_acc).astype(int)
+            
+            # 18. std_5
+            group['std_5'] = s_series.rolling(5, min_periods=1).std().fillna(0)
+            
+            # 19. std_10
+            group['std_10'] = s_series.rolling(10, min_periods=1).std().fillna(0)
+            
+            # 20. z_score_local (过去10个点)
+            roll_mean_10 = s_series.rolling(10, min_periods=1).mean()
+            roll_std_10 = s_series.rolling(10, min_periods=1).std().replace(0, 1) # 避免除0
+            group['z_score_local'] = (s_series - roll_mean_10) / roll_std_10
+            group['z_score_local'] = group['z_score_local'].fillna(0)
+            
+            # ==========================================
+            # 第四类：双向上下文特征 (Look-ahead) (8个)
+            # ==========================================
+            
+            # 21. lead_diff_1 (未来1个点 - 当前) = (t+1) - t
+            group['lead_diff_1'] = s_series.shift(-1) - s_series
+            
+            # 22. lead_diff_3
+            group['lead_diff_3'] = s_series.shift(-3) - s_series
+            
+            # 23. lead_slope_5 (未来5个点的斜率)
+            # 将序列反转，计算past slope，再反转回来，并shift
+            rev_s = s_series.iloc[::-1]
+            rev_slope = rev_s.rolling(5, min_periods=2).apply(calc_slope).fillna(0)
+            # 反转回来是对应"未来"的，但索引是对齐的吗？
+            # rolling是取"过去"5个。
+            # 对t而言，future slope是 t, t+1, ..., t+4 的斜率
+            # 可以用shift后的数据算
+            # 简化：对shift(-5)的rolling(5)不对，应该是反向rolling
+            # 这里用一个近似：shift(-1)后计算rolling(5)，但rolling是向后的
+            # 正确做法：使用indexer或shift
+            # 简单做法：shift(-4)然后取rolling(5)的slope? No.
+            # 最好的办法：利用shift构造matrix然后polyfit，但太慢。
+            # 既然已有 trend_slope_5 (looking back)，我们把整个序列反转计算trend_slope_5，再反转回来，就是looking forward
+            
+            # 反转计算
+            slope_rev = rev_s.rolling(5, min_periods=2).apply(calc_slope).fillna(0)
+            # 反转回来
+            slope_forward = slope_rev.iloc[::-1].values
+            # 注意：反转后的rolling代表的是"未来"向"现在"看。
+            # 比如反转后第0个点是原最后一点。rolling(5)用了原最后5点。
+            # 所以反转回来的第i点，包含了 i, i+1, i+2... 
+            # 但方向是反的。斜率符号要取反？
+            # 如果原序列是递增，反转后是递减，斜率为负。所以要取反。
+            group['lead_slope_5'] = -slope_forward
+            
+            # 24. center_diff ( (t+1) - (t-1) ) / 2
+            group['center_diff'] = (s_series.shift(-1) - s_series.shift(1)) / 2
+            
+            # 25. pre_post_ratio (未来5点均值 / 过去5点均值)
+            # 过去5点均值
+            past_mean = s_series.rolling(5, min_periods=1).mean()
+            # 未来5点均值：反转计算rolling mean再反转
+            future_mean = s_series.iloc[::-1].rolling(5, min_periods=1).mean().iloc[::-1]
+            
+            group['pre_post_ratio'] = future_mean / (past_mean + 1e-6) # 避免除0
+            
+            # 26. lag_rolling_mean_5
+            group['lag_rolling_mean_5'] = past_mean
+            
+            # 27. lead_rolling_mean_5
+            group['lead_rolling_mean_5'] = future_mean
+            
+            # 28. cross_region (lead > lag)
+            group['cross_region'] = (future_mean > (past_mean * 1.02)).astype(int) # 稍微加点阈值
+            
+            # 填充由于shift产生的NaN
+            group = group.fillna(0)
             
             features_list.append(group)
         
         result_df = pd.concat(features_list, ignore_index=True)
-        print(f"特征工程完成，生成 {len(result_df.columns)} 个特征")
+        print(f"特征工程完成，生成 {len(result_df.columns)} 个列")
         
         return result_df
     
@@ -461,9 +659,10 @@ class WellStatusPredictor:
         with open(scaler_path, 'wb') as f:
             pickle.dump({
                 'scaler': self.scaler,
-                'feature_columns': self.feature_columns
+                'feature_columns': self.feature_columns,
+                'preprocessing_params': self.preprocessing_params
             }, f)
-        print(f"Scaler已保存到: {scaler_path}")
+        print(f"Scaler及配置已保存到: {scaler_path}")
         
         # 保存训练参数
         if params is not None:
@@ -482,6 +681,76 @@ class WellStatusPredictor:
                 json.dump(params_info, f, indent=4, ensure_ascii=False)
             
             print(f"参数已保存到: {params_path}")
+    
+    def save_feature_importance(self, memory_dir: str):
+        """保存特征重要性到CSV和生成图表"""
+        if self.model is None or not self.feature_columns:
+            print("警告: 模型未训练或特征列未设置，无法获取特征重要性")
+            return
+        
+        # 获取特征重要性
+        feature_importance = self.model.get_feature_importance()
+        
+        # 创建DataFrame
+        importance_df = pd.DataFrame({
+            'feature': self.feature_columns,
+            'importance': feature_importance
+        }).sort_values('importance', ascending=False)
+        
+        # 创建features文件夹
+        features_dir = os.path.join(memory_dir, "features")
+        if not os.path.exists(features_dir):
+            os.makedirs(features_dir)
+        
+        # 保存CSV
+        csv_path = os.path.join(features_dir, "feature_importance.csv")
+        importance_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+        print(f"特征重要性CSV已保存到: {csv_path}")
+        
+        # Generate chart - top 10 features
+        plt.figure(figsize=(10, 6))
+        top10 = importance_df.head(10)
+        plt.barh(range(len(top10)), top10['importance'].values, color='steelblue')
+        plt.yticks(range(len(top10)), top10['feature'].values, fontsize=11)
+        plt.xticks(fontsize=11)
+        plt.xlabel('Feature Importance', fontsize=14)
+        plt.ylabel('Feature Name', fontsize=14)
+        plt.title('Top 10 Features by Importance', fontsize=14, fontweight='bold')
+        plt.gca().invert_yaxis()  # Most important at the top
+        plt.tight_layout()
+        top10_path = os.path.join(features_dir, "feature_importance_top10.png")
+        plt.savefig(top10_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Feature importance chart (top 10) saved to: {top10_path}")
+
+        # Generate chart - top 20 features
+        plt.figure(figsize=(10, 8))
+        top20 = importance_df.head(20)
+        plt.barh(range(len(top20)), top20['importance'].values, color='steelblue')
+        plt.yticks(range(len(top20)), top20['feature'].values)
+        plt.xlabel('Feature Importance', fontsize=14)
+        plt.ylabel('Feature Name', fontsize=14)
+        plt.title('Top 20 Features by Importance', fontsize=14, fontweight='bold')
+        plt.gca().invert_yaxis()  # Most important at the top
+        plt.tight_layout()
+        top20_path = os.path.join(features_dir, "feature_importance_top20.png")
+        plt.savefig(top20_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Feature importance chart (top 20) saved to: {top20_path}")
+        
+        # Generate chart - all features
+        plt.figure(figsize=(12, max(8, len(importance_df) * 0.3)))
+        plt.barh(range(len(importance_df)), importance_df['importance'].values, color='steelblue')
+        plt.yticks(range(len(importance_df)), importance_df['feature'].values, fontsize=8)
+        plt.xlabel('Feature Importance', fontsize=14)
+        plt.ylabel('Feature Name', fontsize=14)
+        plt.title('Feature Importance (All Features)', fontsize=14, fontweight='bold')
+        plt.gca().invert_yaxis()  # Most important at the top
+        plt.tight_layout()
+        all_path = os.path.join(features_dir, "feature_importance_all.png")
+        plt.savefig(all_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Feature importance chart (all) saved to: {all_path}")
 
 
 class TrainingGUI:
@@ -561,6 +830,33 @@ class TrainingGUI:
         # 添加说明文字
         hint_label = ttk.Label(control_frame, text="(可选: 0.1~0.9, 步进0.1)", font=('Arial', 8), foreground='gray')
         hint_label.grid(row=row, column=1, sticky=tk.W, padx=5)
+        row += 1
+        
+        # 分隔线
+        ttk.Separator(control_frame, orient='horizontal').grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
+        row += 1
+        
+        # 预处理设置
+        ttk.Label(control_frame, text="预处理设置", font=('Arial', 10, 'bold')).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=5)
+        row += 1
+        
+        # Smoothing Method
+        ttk.Label(control_frame, text="去噪方法:").grid(row=row, column=0, sticky=tk.W, pady=5)
+        self.smooth_method_var = tk.StringVar(value="none")
+        method_cb = ttk.Combobox(control_frame, textvariable=self.smooth_method_var, values=["none", "rolling", "savgol"], width=13)
+        method_cb.grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
+        row += 1
+        
+        # Window Size
+        ttk.Label(control_frame, text="窗口大小:").grid(row=row, column=0, sticky=tk.W, pady=5)
+        self.window_size_var = tk.IntVar(value=5)
+        ttk.Entry(control_frame, textvariable=self.window_size_var, width=15).grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
+        row += 1
+        
+        # Poly Order (SG only)
+        ttk.Label(control_frame, text="多项式阶数:").grid(row=row, column=0, sticky=tk.W, pady=5)
+        self.poly_order_var = tk.IntVar(value=2)
+        ttk.Entry(control_frame, textvariable=self.poly_order_var, width=15).grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
         row += 1
         
         # 分隔线
@@ -658,11 +954,14 @@ class TrainingGUI:
         # 创建matplotlib图表
         self.fig = Figure(figsize=(8, 6), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_xlabel('Iteration')
-        self.ax.set_ylabel('Loss (MultiClass)')
-        self.ax.set_title('Training and Validation Loss')
+        self.ax.set_box_aspect(1)
+        self.ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        self.ax.set_xlabel('Iteration', fontsize=14)
+        self.ax.set_ylabel('Loss (MultiClass)', fontsize=14)
+        self.ax.set_title('Training and Validation Loss', fontsize=16)
         self.ax.grid(True, alpha=0.3)
-        self.ax.legend(['Train Loss', 'Validation Loss'])
+        self.ax.tick_params(labelsize=14)
+        self.ax.legend(['Train Loss', 'Validation Loss'], fontsize=14)
         
         self.canvas = FigureCanvasTkAgg(self.fig, master=train_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -705,13 +1004,16 @@ class TrainingGUI:
     def update_plot(self, train_losses, val_losses):
         """更新训练曲线"""
         self.ax.clear()
+        self.ax.set_box_aspect(1)
+        self.ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         self.ax.plot(train_losses, label='Train Loss', color='blue', linewidth=2)
         self.ax.plot(val_losses, label='Validation Loss', color='red', linewidth=2)
-        self.ax.set_xlabel('Iteration')
-        self.ax.set_ylabel('Loss (MultiClass)')
-        self.ax.set_title('Training and Validation Loss')
+        self.ax.set_xlabel('Iteration', fontsize=14)
+        self.ax.set_ylabel('Loss (MultiClass)', fontsize=14)
+        self.ax.set_title('Training and Validation Loss', fontsize=16)
         self.ax.grid(True, alpha=0.3)
-        self.ax.legend()
+        self.ax.tick_params(labelsize=14)
+        self.ax.legend(fontsize=14)
         
         self.canvas.draw()
     
@@ -760,6 +1062,14 @@ class TrainingGUI:
             self.log(f"\nStatus分布:")
             self.log(str(df['status'].value_counts().sort_index()))
             self.log(f"\n井号数量: {df['转换后JH'].nunique()}")
+            
+            # 1.5 设置预处理参数
+            self.predictor.preprocessing_params = {
+                'method': self.smooth_method_var.get(),
+                'window_size': self.window_size_var.get(),
+                'poly_order': self.poly_order_var.get()
+            }
+            self.log(f"\n预处理参数: {self.predictor.preprocessing_params}")
             
             # 2. 特征工程
             self.log("\n2. 特征工程...")
@@ -847,6 +1157,12 @@ class TrainingGUI:
             self.predictor.save_results_by_well(val_df, y_val_pred, y_val_pred_corrected, os.path.join(memory_dir, "test"))
             
             self.log(f"中间结果已保存到 {memory_dir}")
+            
+            # 6.5. 保存特征重要性
+            self.log("\n6.5. 保存特征重要性...")
+            self.status_var.set("保存特征重要性...")
+            self.predictor.save_feature_importance(memory_dir)
+            self.log("特征重要性已保存")
 
             # 7. 保存模型
             self.log("\n7. 保存模型...")
