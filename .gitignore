@@ -5,7 +5,7 @@
 /data
 /memory
 
-#*memory*/
+*memory*/
 
-#*.csv
+*.csv
 
