@@ -618,7 +618,7 @@ class WellStatusPredictor:
         return result
     
     def evaluate(self, y_true: np.ndarray, y_pred: np.ndarray, 
-                 y_pred_corrected: np.ndarray = None) -> Dict:
+                 y_pred_corrected: np.ndarray = None, y_pred_proba: np.ndarray = None) -> Dict:
         """
         评估模型性能
         """
@@ -633,16 +633,22 @@ class WellStatusPredictor:
         
         print(f"Accuracy: {acc:.4f}")
         print(f"F1-Score (macro): {f1:.4f}")
-        print("\nClassification Report:")
-        print(classification_report(y_true, y_pred, 
-                                   target_names=['Vertical(0)', 'Build-up(1)', 'Hold(2)', 'Drop-off(3)'],
-                                   zero_division=0))
         
         results = {
             'accuracy': acc,
             'f1_macro': f1,
             'confusion_matrix': confusion_matrix(y_true, y_pred)
         }
+
+        if y_pred_proba is not None:
+            ll = log_loss(y_true, y_pred_proba)
+            print(f"Log Loss: {ll:.4f}")
+            results['log_loss'] = ll
+
+        print("\nClassification Report:")
+        print(classification_report(y_true, y_pred, 
+                                   target_names=['Vertical(0)', 'Build-up(1)', 'Hold(2)', 'Drop-off(3)'],
+                                   zero_division=0))
         
         # Corrected prediction evaluation
         if y_pred_corrected is not None:
@@ -712,6 +718,55 @@ class WellStatusPredictor:
             
             print(f"参数已保存到: {params_path}")
     
+    def save_confusion_matrix(self, y_true: np.ndarray, y_pred: np.ndarray, output_dir: str, prefix: str = "confusion_matrix"):
+        """保存混淆矩阵到CSV和图片"""
+        
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            
+        # Calculate confusion matrix
+        cm = confusion_matrix(y_true, y_pred)
+        
+        # Save CSV
+        labels = ['Vertical(0)', 'Build-up(1)', 'Hold(2)', 'Drop-off(3)']
+        cm_df = pd.DataFrame(cm, index=labels, columns=labels)
+        csv_path = os.path.join(output_dir, f"{prefix}.csv")
+        cm_df.to_csv(csv_path, encoding='utf-8-sig')
+        print(f"混淆矩阵CSV已保存到: {csv_path}")
+        
+        # Save Image (SCI style)
+        plt.figure(figsize=(12, 10))
+        
+        # Set font style
+        plt.rcParams['font.family'] = 'Arial'
+        
+        # Plot heatmap
+        # Increase font sizes:
+        # Annotations (middle numbers): 14 * 1.5 ≈ 22
+        # Labels/Title/Legend: Increase by 2/3 (approx 1.67x)
+        # Title: 16 * 1.67 ≈ 26
+        # Labels: 14 * 1.67 ≈ 24
+        # Ticks: 12 * 1.67 ≈ 20
+        
+        ax = sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                    xticklabels=labels, yticklabels=labels,
+                    annot_kws={"size": 22, "weight": "bold"})
+        
+        # Adjust colorbar font size
+        cbar = ax.collections[0].colorbar
+        cbar.ax.tick_params(labelsize=20)
+        
+        plt.title('Confusion Matrix', fontsize=26, fontweight='bold', pad=24)
+        plt.xlabel('Predicted Label', fontsize=24, fontweight='bold')
+        plt.ylabel('True Label', fontsize=24, fontweight='bold')
+        plt.tick_params(axis='both', which='major', labelsize=20)
+        
+        plt.tight_layout()
+        img_path = os.path.join(output_dir, f"{prefix}.png")
+        plt.savefig(img_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"混淆矩阵图片已保存到: {img_path}")
+
     def save_feature_importance(self, memory_dir: str):
         """保存特征重要性到CSV和生成图表"""
         if self.model is None or not self.feature_columns:
@@ -798,6 +853,7 @@ class TrainingGUI:
         # 训练数据
         self.train_losses = []
         self.val_losses = []
+        self.iterations = []
         
         self.setup_ui()
         
@@ -1043,16 +1099,17 @@ class TrainingGUI:
     
     def update_plot(self, iteration, train_loss, val_loss):
         """更新训练曲线"""
+        self.iterations.append(iteration)
         self.train_losses.append(train_loss)
         self.val_losses.append(val_loss)
         
         self.ax.clear()
         self.ax.set_box_aspect(1)
         self.ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-        self.ax.plot(self.train_losses, label='Train Loss', color='blue', linewidth=2)
-        self.ax.plot(self.val_losses, label='Validation Loss', color='red', linewidth=2)
+        self.ax.plot(self.iterations, self.train_losses, label='Train Loss', color='blue', linewidth=2)
+        self.ax.plot(self.iterations, self.val_losses, label='Validation Loss', color='red', linewidth=2)
         self.ax.set_xlabel('Iteration', fontsize=14)
-        self.ax.set_ylabel('Loss', fontsize=14)
+        self.ax.set_ylabel('Loss (MultiClass)', fontsize=14)
         self.ax.set_title('Training and Validation Loss', fontsize=16)
         self.ax.grid(True, alpha=0.3)
         self.ax.tick_params(labelsize=14)
@@ -1083,6 +1140,7 @@ class TrainingGUI:
         # 清空之前的数据
         self.train_losses = []
         self.val_losses = []
+        self.iterations = []
         self.log_text.delete(1.0, tk.END)
         self.result_text.delete(1.0, tk.END)
         
@@ -1151,27 +1209,47 @@ class TrainingGUI:
             self.log(f"最佳迭代: {history['best_iteration']}")
             self.log(f"最佳分数: {history['best_score']:.6f}")
             
-            # 6. 验证集评估
-            self.log("\n5. 验证集评估...")
+            # 6. 模型评估
+            self.log("\n5. 模型评估...")
             self.status_var.set("评估中...")
             
+            # 5.1 训练集评估
+            self.log("\n[训练集评估]")
+            y_train_pred_proba = self.predictor.predict_proba(X_train)
+            y_train_pred = np.argmax(y_train_pred_proba, axis=1)
+            # 为了效率，训练集只评估原始预测，不应用规则（规则主要用于测试/验证）
+            train_results = self.predictor.evaluate(y_train, y_train_pred, y_pred_proba=y_train_pred_proba)
+            
+            # 5.2 验证集评估
+            self.log("\n[验证集评估]")
             y_val_pred_proba = self.predictor.predict_proba(X_val)
             y_val_pred = np.argmax(y_val_pred_proba, axis=1)
             y_val_pred_corrected = self.predictor.apply_rules(val_df, y_val_pred, y_val_pred_proba)
-            val_results = self.predictor.evaluate(y_val, y_val_pred, y_val_pred_corrected)
+            val_results = self.predictor.evaluate(y_val, y_val_pred, y_val_pred_corrected, y_pred_proba=y_val_pred_proba)
             
             # 显示结果
             result_text = "="*60 + "\n"
-            result_text += "验证集评估结果\n"
+            result_text += "模型评估结果\n"
             result_text += "="*60 + "\n\n"
-            result_text += "[原始预测]\n"
-            result_text += f"准确率: {val_results['accuracy']:.4f}\n"
-            result_text += f"F1分数 (macro): {val_results['f1_macro']:.4f}\n\n"
+            
+            result_text += "[训练集]\n"
+            result_text += f"Accuracy: {train_results['accuracy']:.4f}\n"
+            result_text += f"F1-Score (macro): {train_results['f1_macro']:.4f}\n"
+            if 'log_loss' in train_results:
+                result_text += f"Log Loss: {train_results['log_loss']:.4f}\n"
+            result_text += "\n"
+            
+            result_text += "[验证集 - 原始预测]\n"
+            result_text += f"Accuracy: {val_results['accuracy']:.4f}\n"
+            result_text += f"F1-Score (macro): {val_results['f1_macro']:.4f}\n"
+            if 'log_loss' in val_results:
+                result_text += f"Log Loss: {val_results['log_loss']:.4f}\n"
+            result_text += "\n"
             
             if 'accuracy_corrected' in val_results:
-                result_text += "[规则修正后]\n"
-                result_text += f"准确率: {val_results['accuracy_corrected']:.4f}\n"
-                result_text += f"F1分数 (macro): {val_results['f1_macro_corrected']:.4f}\n"
+                result_text += "[验证集 - 规则修正后]\n"
+                result_text += f"Accuracy: {val_results['accuracy_corrected']:.4f}\n"
+                result_text += f"F1-Score (macro): {val_results['f1_macro_corrected']:.4f}\n"
                 result_text += f"改进: {val_results['accuracy_corrected']-val_results['accuracy']:+.4f}\n"
             
             self.result_text.insert(tk.END, result_text)
@@ -1180,9 +1258,7 @@ class TrainingGUI:
             self.log("\n6. 保存中间结果...")
             self.status_var.set("保存中间结果...")
             
-            # Predict on training set
-            y_train_pred_proba = self.predictor.predict_proba(X_train)
-            y_train_pred = np.argmax(y_train_pred_proba, axis=1)
+            # Apply rules for training set for saving (calculated above)
             y_train_pred_corrected = self.predictor.apply_rules(train_df, y_train_pred, y_train_pred_proba)
             
             # Define memory directory
@@ -1191,6 +1267,12 @@ class TrainingGUI:
             
             self.predictor.save_results_by_well(train_df, y_train_pred, y_train_pred_corrected, os.path.join(memory_dir, "train"))
             self.predictor.save_results_by_well(val_df, y_val_pred, y_val_pred_corrected, os.path.join(memory_dir, "test"))
+            
+            # 保存混淆矩阵
+            self.log("6.1. 保存混淆矩阵...")
+            test_dir = os.path.join(memory_dir, "test")
+            self.predictor.save_confusion_matrix(y_val, y_val_pred, test_dir, "confusion_matrix_val_origin")
+            self.predictor.save_confusion_matrix(y_val, y_val_pred_corrected, test_dir, "confusion_matrix_val_corrected")
             
             self.log(f"中间结果已保存到 {memory_dir}")
             
@@ -1333,6 +1415,13 @@ class TrainingGUI:
             predict_dir = os.path.join(data_dir, "predict_gbm")
             self.predictor.save_results_by_well(df, predictions, corrected_predictions, predict_dir)
             self.log(f"   ✓ 分井结果已保存到: {predict_dir}")
+            
+            # 7.6 保存混淆矩阵 (如果有真实标签)
+            if 'status' in df.columns:
+                self.log("\n7.6 保存混淆矩阵...")
+                y_true = df['status'].values
+                self.predictor.save_confusion_matrix(y_true, predictions, predict_dir, "confusion_matrix_pred_origin")
+                self.predictor.save_confusion_matrix(y_true, corrected_predictions, predict_dir, "confusion_matrix_pred_corrected")
             
             self.status_var.set("预测完成")
             self.progress_var.set(100)

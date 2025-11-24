@@ -1,19 +1,18 @@
 """
-井段状态预测模型训练脚本 - GUI版本 (XGBoost)
+井段状态预测模型训练脚本 - XGBoost GUI版本
 """
 
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder, RobustScaler
-from sklearn.utils.class_weight import compute_sample_weight
-from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix, log_loss
 import xgboost as xgb
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-import seaborn as sns
 from matplotlib.ticker import MaxNLocator
+import seaborn as sns
 from typing import Tuple, Dict
 import warnings
 warnings.filterwarnings('ignore')
@@ -23,8 +22,10 @@ from scipy import stats
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
-import queue
 import os
+import json
+import pickle
+from datetime import datetime
 
 # Set Arial font
 from matplotlib import rcParams
@@ -34,7 +35,7 @@ rcParams['axes.unicode_minus'] = False
 
 
 class WellStatusPredictor:
-    """井段状态预测器 (XGBoost版)"""
+    """井段状态预测器 (XGBoost)"""
     
     def __init__(self):
         self.model = None
@@ -49,31 +50,18 @@ class WellStatusPredictor:
     
     def load_model(self, model_path: str):
         """加载已训练的模型及相关配置"""
-        import pickle
         
-        # 自动纠正路径：如果用户选择了参数文件(_params.json)，尝试切换到模型文件(.json)
-        if model_path.endswith('_params.json'):
-            adjusted_path = model_path.replace('_params.json', '.json')
-            if os.path.exists(adjusted_path):
-                print(f"提示: 检测到选择了参数文件，自动切换到模型文件: {adjusted_path}")
-                model_path = adjusted_path
-
         # 加载模型
-        self.model = xgb.Booster()
-        try:
-            self.model.load_model(model_path)
-        except Exception as e:
-            if 'Invalid cast' in str(e):
-                raise ValueError(f"模型文件格式错误: {model_path}\n请确保选择了正确的模型文件(.json)，而不是参数文件(_params.json)。")
-            raise e
-            
+        self.model = xgb.XGBClassifier()
+        self.model.load_model(model_path)
         print(f"模型已加载: {model_path}")
         
         # 尝试加载scaler和feature_columns
-        # 兼容 .json, .model, .txt 等后缀
-        base_path = os.path.splitext(model_path)[0]
-        scaler_path = base_path + '_scaler.pkl'
-        
+        scaler_path = model_path.replace('.json', '_scaler.pkl')
+        if not os.path.exists(scaler_path):
+             # 兼容旧命名习惯
+             scaler_path = model_path.replace('.model', '_scaler.pkl')
+             
         if os.path.exists(scaler_path):
             with open(scaler_path, 'rb') as f:
                 data = pickle.load(f)
@@ -88,7 +76,7 @@ class WellStatusPredictor:
             print(f"配置已加载: {scaler_path}")
             print(f"预处理参数: {self.preprocessing_params}")
         else:
-            print(f"警告: 未找到scaler文件 {scaler_path}，预测可能不准确")
+            print(f"警告: 未找到配置文件 {scaler_path}，预测可能不准确")
         
     def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -208,11 +196,6 @@ class WellStatusPredictor:
             
             # 7. diff_3
             group['diff_3'] = s_series.diff(3).fillna(0)
-            
-            # 辅助函数：计算滚动斜率
-            def calc_slope(x):
-                if len(x) < 2: return 0
-                return np.polyfit(np.arange(len(x)), x, 1)[0]
             
             # 8. trend_slope_5
             group['trend_slope_5'] = s_series.rolling(5, min_periods=2).apply(calc_slope).fillna(0)
@@ -428,73 +411,61 @@ class WellStatusPredictor:
         """
         训练XGBoost模型
         """
-        print("\n开始训练模型(XGBoost)...")
+        print("\n开始训练模型...")
         
-        # 计算样本权重以处理类别不平衡
-        print("计算样本权重以处理类别不平衡...")
-        sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
+        # 准备XGBoost参数
+        xgb_params = {
+            'n_estimators': params.get('iterations', 1000),
+            'learning_rate': params.get('learning_rate', 0.05),
+            'max_depth': params.get('depth', 6),
+            'reg_lambda': params.get('l2_leaf_reg', 3),
+            'min_child_weight': params.get('min_data_in_leaf', 1),
+            'objective': 'multi:softprob',
+            'num_class': 4,
+            'eval_metric': 'mlogloss',
+            'random_state': 42,
+            'early_stopping_rounds': params.get('early_stopping_rounds', 50),
+            'n_jobs': -1
+        }
         
-        # 创建数据矩阵
-        dtrain = xgb.DMatrix(X_train, label=y_train, weight=sample_weights)
-        dval = xgb.DMatrix(X_val, label=y_val)
+        self.model = xgb.XGBClassifier(**xgb_params)
         
-        # 训练历史记录
-        train_losses = []
-        val_losses = []
-        
-        # 自定义回调函数，用于记录和更新GUI
-        class GUICallback(xgb.callback.TrainingCallback):
-            def after_iteration(self, model, epoch, evals_log):
-                # evals_log 结构: {'train': {'mlogloss': [...]}, 'valid': {'mlogloss': [...]}}
-                try:
-                    # 获取最新的loss值
-                    # 注意: 不同版本的xgboost evals_log结构可能略有不同，这里假设标准结构
-                    train_loss = evals_log['train']['mlogloss'][-1]
-                    val_loss = evals_log['valid']['mlogloss'][-1]
-                    
-                    train_losses.append(train_loss)
-                    val_losses.append(val_loss)
-                    
-                    if callback:
-                        callback(epoch, train_loss, val_loss)
-                except Exception as e:
-                    # 忽略回调中的错误，以免中断训练
-                    pass
-                return False
-
         # 训练模型
-        evals = [(dtrain, 'train'), (dval, 'valid')]
-        
-        self.model = xgb.train(
-            params,
-            dtrain,
-            num_boost_round=params.get('num_boost_round', 500),
-            evals=evals,
-            callbacks=[GUICallback()],
-            early_stopping_rounds=params.get('early_stopping_rounds', 50),
-            verbose_eval=10
+        # XGBoost fit support eval_set and verbose
+        self.model.fit(
+            X_train, y_train,
+            eval_set=[(X_train, y_train), (X_val, y_val)],
+            verbose=100
         )
         
         print("模型训练完成")
         
+        # 获取训练历史
+        evals_result = self.model.evals_result()
+        # XGBoost evals_result 结构: {'validation_0': {'mlogloss': [...]}, 'validation_1': {'mlogloss': [...]}}
+        
+        train_losses = evals_result['validation_0']['mlogloss']
+        val_losses = evals_result['validation_1']['mlogloss']
+        
+        # 如果有回调，我们在最后调用一次以更新图表
+        if callback:
+            pass
+
         return {
             'best_iteration': self.model.best_iteration,
-            'best_score': self.model.best_score,
+            'best_score': val_losses[self.model.best_iteration] if hasattr(self.model, 'best_iteration') else min(val_losses),
             'train_losses': train_losses,
             'val_losses': val_losses
         }
     
     def predict(self, X: np.ndarray) -> np.ndarray:
         """预测"""
-        dtest = xgb.DMatrix(X)
-        # XGBoost predict对于多分类默认返回 (N, n_classes) 的概率矩阵 (使用multi:softprob)
-        y_pred_proba = self.model.predict(dtest)
+        y_pred_proba = self.model.predict_proba(X)
         return np.argmax(y_pred_proba, axis=1)
     
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """获取预测概率"""
-        dtest = xgb.DMatrix(X)
-        return self.model.predict(dtest)
+        return self.model.predict_proba(X)
     
     def apply_rules(self, df: pd.DataFrame, predictions: np.ndarray, prediction_proba: np.ndarray = None) -> np.ndarray:
         """
@@ -614,7 +585,7 @@ class WellStatusPredictor:
         return result
     
     def evaluate(self, y_true: np.ndarray, y_pred: np.ndarray, 
-                 y_pred_corrected: np.ndarray = None) -> Dict:
+                 y_pred_corrected: np.ndarray = None, y_pred_proba: np.ndarray = None) -> Dict:
         """
         评估模型性能
         """
@@ -629,16 +600,22 @@ class WellStatusPredictor:
         
         print(f"Accuracy: {acc:.4f}")
         print(f"F1-Score (macro): {f1:.4f}")
-        print("\nClassification Report:")
-        print(classification_report(y_true, y_pred, 
-                                   target_names=['Vertical(0)', 'Build-up(1)', 'Hold(2)', 'Drop-off(3)'],
-                                   zero_division=0))
         
         results = {
             'accuracy': acc,
             'f1_macro': f1,
             'confusion_matrix': confusion_matrix(y_true, y_pred)
         }
+
+        if y_pred_proba is not None:
+            ll = log_loss(y_true, y_pred_proba)
+            print(f"Log Loss: {ll:.4f}")
+            results['log_loss'] = ll
+
+        print("\nClassification Report:")
+        print(classification_report(y_true, y_pred, 
+                                   target_names=['Vertical(0)', 'Build-up(1)', 'Hold(2)', 'Drop-off(3)'],
+                                   zero_division=0))
         
         # Corrected prediction evaluation
         if y_pred_corrected is not None:
@@ -659,11 +636,8 @@ class WellStatusPredictor:
         
         return results
     
-    def save_model(self, filename: str = "well_status_xgboost.json", params: Dict = None):
+    def save_model(self, filename: str = "well_status_xgboost_model.json", params: Dict = None):
         """保存模型到Models文件夹"""
-        import json
-        import pickle
-        from datetime import datetime
         
         # 创建Models文件夹
         models_dir = "Models"
@@ -671,11 +645,11 @@ class WellStatusPredictor:
             os.makedirs(models_dir)
             print(f"创建文件夹: {models_dir}")
         
-        # 保存模型到Models文件夹
-        # 强制使用json后缀如果用户没有指定
+        # 确保文件名后缀正确
         if not filename.endswith('.json'):
             filename = os.path.splitext(filename)[0] + '.json'
             
+        # 保存模型到Models文件夹
         model_path = os.path.join(models_dir, filename)
         self.model.save_model(model_path)
         print(f"\n模型已保存到: {model_path}")
@@ -698,7 +672,7 @@ class WellStatusPredictor:
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'model_file': filename,
                 'best_iteration': self.model.best_iteration,
-                'best_score': self.model.best_score,
+                'best_score': self.model.best_score if hasattr(self.model, 'best_score') else None,
                 'parameters': params
             }
             
@@ -709,6 +683,55 @@ class WellStatusPredictor:
                 json.dump(params_info, f, indent=4, ensure_ascii=False)
             
             print(f"参数已保存到: {params_path}")
+    
+    def save_confusion_matrix(self, y_true: np.ndarray, y_pred: np.ndarray, output_dir: str, prefix: str = "confusion_matrix"):
+        """保存混淆矩阵到CSV和图片"""
+        
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            
+        # Calculate confusion matrix
+        cm = confusion_matrix(y_true, y_pred)
+        
+        # Save CSV
+        labels = ['Vertical(0)', 'Build-up(1)', 'Hold(2)', 'Drop-off(3)']
+        cm_df = pd.DataFrame(cm, index=labels, columns=labels)
+        csv_path = os.path.join(output_dir, f"{prefix}.csv")
+        cm_df.to_csv(csv_path, encoding='utf-8-sig')
+        print(f"混淆矩阵CSV已保存到: {csv_path}")
+        
+        # Save Image (SCI style)
+        plt.figure(figsize=(12, 10))
+        
+        # Set font style
+        plt.rcParams['font.family'] = 'Arial'
+        
+        # Plot heatmap
+        # Increase font sizes:
+        # Annotations (middle numbers): 14 * 1.5 ≈ 22
+        # Labels/Title/Legend: Increase by 2/3 (approx 1.67x)
+        # Title: 16 * 1.67 ≈ 26
+        # Labels: 14 * 1.67 ≈ 24
+        # Ticks: 12 * 1.67 ≈ 20
+        
+        ax = sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                    xticklabels=labels, yticklabels=labels,
+                    annot_kws={"size": 22, "weight": "bold"})
+        
+        # Adjust colorbar font size
+        cbar = ax.collections[0].colorbar
+        cbar.ax.tick_params(labelsize=20)
+        
+        plt.title('Confusion Matrix', fontsize=26, fontweight='bold', pad=24)
+        plt.xlabel('Predicted Label', fontsize=24, fontweight='bold')
+        plt.ylabel('True Label', fontsize=24, fontweight='bold')
+        plt.tick_params(axis='both', which='major', labelsize=20)
+        
+        plt.tight_layout()
+        img_path = os.path.join(output_dir, f"{prefix}.png")
+        plt.savefig(img_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"混淆矩阵图片已保存到: {img_path}")
 
     def save_feature_importance(self, memory_dir: str):
         """保存特征重要性到CSV和生成图表"""
@@ -716,23 +739,13 @@ class WellStatusPredictor:
             print("警告: 模型未训练或特征列未设置，无法获取特征重要性")
             return
         
-        # 获取特征重要性 (XGBoost)
-        importance_dict = self.model.get_score(importance_type='gain')
+        # 获取特征重要性
+        feature_importance = self.model.feature_importances_
         
-        features = []
-        importances = []
-        
-        for i, col_name in enumerate(self.feature_columns):
-            # XGBoost default feature name is f{i}
-            f_key = f'f{i}'
-            score = importance_dict.get(f_key, 0)
-            features.append(col_name)
-            importances.append(score)
-            
         # 创建DataFrame
         importance_df = pd.DataFrame({
-            'feature': features,
-            'importance': importances
+            'feature': self.feature_columns,
+            'importance': feature_importance
         }).sort_values('importance', ascending=False)
         
         # 创建features文件夹
@@ -751,7 +764,7 @@ class WellStatusPredictor:
         plt.barh(range(len(top10)), top10['importance'].values, color='steelblue')
         plt.yticks(range(len(top10)), top10['feature'].values, fontsize=11)
         plt.xticks(fontsize=11)
-        plt.xlabel('Feature Importance (Gain)', fontsize=14)
+        plt.xlabel('Feature Importance', fontsize=14)
         plt.ylabel('Feature Name', fontsize=14)
         plt.title('Top 10 Features by Importance', fontsize=14, fontweight='bold')
         plt.gca().invert_yaxis()  # Most important at the top
@@ -766,29 +779,30 @@ class WellStatusPredictor:
         top20 = importance_df.head(20)
         plt.barh(range(len(top20)), top20['importance'].values, color='steelblue')
         plt.yticks(range(len(top20)), top20['feature'].values)
-        plt.xlabel('Feature Importance (Gain)', fontsize=14)
+        plt.xlabel('Feature Importance', fontsize=14)
         plt.ylabel('Feature Name', fontsize=14)
-        plt.title('Top 20 Features', fontsize=14, fontweight='bold')
+        plt.title('Top 20 Features by Importance', fontsize=14, fontweight='bold')
         plt.gca().invert_yaxis()  # Most important at the top
         plt.tight_layout()
         top20_path = os.path.join(features_dir, "feature_importance_top20.png")
         plt.savefig(top20_path, dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"Feature Importance Chart (Top 20) saved to: {top20_path}")
+        print(f"Feature importance chart (top 20) saved to: {top20_path}")
         
         # Generate chart - all features
         plt.figure(figsize=(12, max(8, len(importance_df) * 0.3)))
         plt.barh(range(len(importance_df)), importance_df['importance'].values, color='steelblue')
         plt.yticks(range(len(importance_df)), importance_df['feature'].values, fontsize=8)
-        plt.xlabel('Feature Importance (Gain)', fontsize=14)
+        plt.xlabel('Feature Importance', fontsize=14)
         plt.ylabel('Feature Name', fontsize=14)
-        plt.title('All Features', fontsize=14, fontweight='bold')
+        plt.title('Feature Importance (All Features)', fontsize=14, fontweight='bold')
         plt.gca().invert_yaxis()  # Most important at the top
         plt.tight_layout()
         all_path = os.path.join(features_dir, "feature_importance_all.png")
         plt.savefig(all_path, dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"Feature Importance Chart (All) saved to: {all_path}")
+        print(f"Feature importance chart (all) saved to: {all_path}")
+
 
 class TrainingGUI:
     """训练界面GUI"""
@@ -845,6 +859,7 @@ class TrainingGUI:
         ttk.Label(control_frame, text="验证集比例:").grid(row=row, column=0, sticky=tk.W, pady=5)
         self.val_size_var = tk.DoubleVar(value=0.2)
         
+        # 创建滑动条，范围0.1-0.9，步进0.1
         val_scale = ttk.Scale(
             control_frame, 
             from_=0.1, 
@@ -853,16 +868,23 @@ class TrainingGUI:
             orient=tk.HORIZONTAL,
             length=150
         )
+        # 拖动时自动取整到0.1
         val_scale.configure(command=lambda v: self.val_size_var.set(round(float(v) * 10) / 10))
         val_scale.grid(row=row, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
         
+        # 显示标签，格式化为一位小数
         self.val_label = ttk.Label(control_frame, text="0.2", width=5)
         self.val_label.grid(row=row, column=2, pady=5)
         self.val_size_var.trace('w', lambda *args: self.val_label.config(text=f"{self.val_size_var.get():.1f}"))
         row += 1
         
+        # 添加说明文字
         hint_label = ttk.Label(control_frame, text="(可选: 0.1~0.9, 步进0.1)", font=('Arial', 8), foreground='gray')
         hint_label.grid(row=row, column=1, sticky=tk.W, padx=5)
+        row += 1
+        
+        # 分隔线
+        ttk.Separator(control_frame, orient='horizontal').grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
         row += 1
         
         # 预处理设置
@@ -896,28 +918,22 @@ class TrainingGUI:
         ttk.Label(control_frame, text="XGBoost 超参数", font=('Arial', 10, 'bold')).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=5)
         row += 1
         
-        # Learning Rate (eta)
-        ttk.Label(control_frame, text="学习率 (eta):").grid(row=row, column=0, sticky=tk.W, pady=5)
-        self.lr_var = tk.DoubleVar(value=0.1)
+        # Learning Rate
+        ttk.Label(control_frame, text="学习率:").grid(row=row, column=0, sticky=tk.W, pady=5)
+        self.lr_var = tk.DoubleVar(value=0.05)
         ttk.Entry(control_frame, textvariable=self.lr_var, width=15).grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
         row += 1
         
-        # Max Leaves
-        ttk.Label(control_frame, text="叶子节点数 (0=不限):").grid(row=row, column=0, sticky=tk.W, pady=5)
-        self.max_leaves_var = tk.IntVar(value=0)
-        ttk.Entry(control_frame, textvariable=self.max_leaves_var, width=15).grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
+        # Depth
+        ttk.Label(control_frame, text="最大深度 (Max Depth):").grid(row=row, column=0, sticky=tk.W, pady=5)
+        self.depth_var = tk.IntVar(value=6)
+        ttk.Entry(control_frame, textvariable=self.depth_var, width=15).grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
         row += 1
         
-        # Max Depth
-        ttk.Label(control_frame, text="最大深度:").grid(row=row, column=0, sticky=tk.W, pady=5)
-        self.max_depth_var = tk.IntVar(value=6)
-        ttk.Entry(control_frame, textvariable=self.max_depth_var, width=15).grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
-        row += 1
-        
-        # Num Boost Round
-        ttk.Label(control_frame, text="训练轮数:").grid(row=row, column=0, sticky=tk.W, pady=5)
-        self.num_boost_var = tk.IntVar(value=500)
-        ttk.Entry(control_frame, textvariable=self.num_boost_var, width=15).grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
+        # Iterations
+        ttk.Label(control_frame, text="迭代次数 (Estimators):").grid(row=row, column=0, sticky=tk.W, pady=5)
+        self.iterations_var = tk.IntVar(value=1000)
+        ttk.Entry(control_frame, textvariable=self.iterations_var, width=15).grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
         row += 1
         
         # Early Stopping
@@ -926,22 +942,16 @@ class TrainingGUI:
         ttk.Entry(control_frame, textvariable=self.early_stop_var, width=15).grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
         row += 1
         
-        # Min Child Weight
-        ttk.Label(control_frame, text="最小样本数(权重):").grid(row=row, column=0, sticky=tk.W, pady=5)
-        self.min_child_var = tk.IntVar(value=1)
-        ttk.Entry(control_frame, textvariable=self.min_child_var, width=15).grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
+        # L2 Leaf Reg
+        ttk.Label(control_frame, text="L2正则化 (Reg Lambda):").grid(row=row, column=0, sticky=tk.W, pady=5)
+        self.l2_reg_var = tk.DoubleVar(value=3.0)
+        ttk.Entry(control_frame, textvariable=self.l2_reg_var, width=15).grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
         row += 1
         
-        # Colsample By Tree (Feature Fraction)
-        ttk.Label(control_frame, text="特征采样率:").grid(row=row, column=0, sticky=tk.W, pady=5)
-        self.feature_frac_var = tk.DoubleVar(value=0.8)
-        ttk.Entry(control_frame, textvariable=self.feature_frac_var, width=15).grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
-        row += 1
-        
-        # Subsample (Bagging Fraction)
-        ttk.Label(control_frame, text="样本采样率:").grid(row=row, column=0, sticky=tk.W, pady=5)
-        self.bagging_frac_var = tk.DoubleVar(value=0.8)
-        ttk.Entry(control_frame, textvariable=self.bagging_frac_var, width=15).grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
+        # Min Data In Leaf
+        ttk.Label(control_frame, text="最小子权重 (Min Child):").grid(row=row, column=0, sticky=tk.W, pady=5)
+        self.min_data_var = tk.IntVar(value=1)
+        ttk.Entry(control_frame, textvariable=self.min_data_var, width=15).grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
         row += 1
         
         # 分隔线
@@ -998,7 +1008,7 @@ class TrainingGUI:
         self.ax.set_box_aspect(1)
         self.ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         self.ax.set_xlabel('Iteration', fontsize=14)
-        self.ax.set_ylabel('Loss (Log Loss)', fontsize=14)
+        self.ax.set_ylabel('Loss (mLogLoss)', fontsize=14)
         self.ax.set_title('Training and Validation Loss', fontsize=16)
         self.ax.grid(True, alpha=0.3)
         self.ax.tick_params(labelsize=14)
@@ -1042,30 +1052,21 @@ class TrainingGUI:
         self.log_text.see(tk.END)
         print(message)  # 同时打印到控制台
     
-    def update_plot(self, iteration, train_loss, val_loss):
+    def update_plot(self, train_losses, val_losses):
         """更新训练曲线"""
-        self.train_losses.append(train_loss)
-        self.val_losses.append(val_loss)
-        
         self.ax.clear()
-        self.ax.plot(self.train_losses, label='Train Loss', color='blue', linewidth=2)
-        self.ax.plot(self.val_losses, label='Validation Loss', color='red', linewidth=2)
+        self.ax.set_box_aspect(1)
+        self.ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        self.ax.plot(train_losses, label='Train Loss', color='blue', linewidth=2)
+        self.ax.plot(val_losses, label='Validation Loss', color='red', linewidth=2)
         self.ax.set_xlabel('Iteration', fontsize=14)
-        self.ax.set_ylabel('Loss (Log Loss)', fontsize=14)
+        self.ax.set_ylabel('Loss (MultiClass)', fontsize=14)
         self.ax.set_title('Training and Validation Loss', fontsize=16)
         self.ax.grid(True, alpha=0.3)
         self.ax.tick_params(labelsize=14)
         self.ax.legend(fontsize=14)
-        # 设置正方形比例和整数X轴
-        self.ax.set_box_aspect(1)
-        self.ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         
         self.canvas.draw()
-        
-        # 更新进度
-        progress = (iteration / self.num_boost_var.get()) * 100
-        self.progress_var.set(progress)
-        self.status_var.set(f"训练中... 迭代 {iteration}/{self.num_boost_var.get()}")
     
     def start_training(self):
         """开始训练"""
@@ -1087,6 +1088,7 @@ class TrainingGUI:
         self.val_losses = []
         self.log_text.delete(1.0, tk.END)
         self.result_text.delete(1.0, tk.END)
+        self.progress_var.set(0)
         
         # 在新线程中运行训练
         self.training_thread = threading.Thread(target=self.train_model)
@@ -1137,28 +1139,15 @@ class TrainingGUI:
             self.log(f"训练集样本数: {len(X_train)}")
             self.log(f"验证集样本数: {len(X_val)}")
             
-            # 4. 设置参数 (XGBoost)
+            # 4. 设置参数
             params = {
-                'objective': 'multi:softprob',  # 多分类概率
-                'num_class': 4,
-                'eval_metric': 'mlogloss',
-                'booster': 'gbtree',
-                'grow_policy': 'lossguide',
-                'eta': self.lr_var.get(),  # 学习率
-                'max_leaves': self.max_leaves_var.get(),
-                'max_depth': self.max_depth_var.get(),
-                'min_child_weight': self.min_child_var.get(),
-                'subsample': self.bagging_frac_var.get(),
-                'colsample_bytree': self.feature_frac_var.get(),
-                'verbosity': 1,
-                'nthread': -1,
-                'num_boost_round': self.num_boost_var.get(),
+                'iterations': self.iterations_var.get(),
+                'learning_rate': self.lr_var.get(),
+                'depth': self.depth_var.get(),
+                'l2_leaf_reg': self.l2_reg_var.get(),
+                'min_data_in_leaf': self.min_data_var.get(),
                 'early_stopping_rounds': self.early_stop_var.get()
             }
-            
-            self.log("\n参数设置:")
-            for k, v in params.items():
-                self.log(f"{k}: {v}")
             
             # 5. 训练模型
             self.log("\n4. 开始训练模型...")
@@ -1166,34 +1155,57 @@ class TrainingGUI:
             
             history = self.predictor.train(
                 X_train, y_train, X_val, y_val, params,
-                callback=lambda iter, train_loss, val_loss: self.root.after(0, self.update_plot, iter, train_loss, val_loss)
+                callback=None
             )
+            
+            # 更新图表
+            self.root.after(0, self.update_plot, history['train_losses'], history['val_losses'])
             
             self.log(f"\n训练完成！")
             self.log(f"最佳迭代: {history['best_iteration']}")
-            self.log(f"最佳分数: {history['best_score']}")
+            self.log(f"最佳分数: {history['best_score']:.6f}")
             
-            # 6. 验证集评估
-            self.log("\n5. 验证集评估...")
+            # 6. 模型评估
+            self.log("\n5. 模型评估...")
             self.status_var.set("评估中...")
             
+            # 5.1 训练集评估
+            self.log("\n[训练集评估]")
+            y_train_pred_proba = self.predictor.predict_proba(X_train)
+            y_train_pred = np.argmax(y_train_pred_proba, axis=1)
+            # 为了效率，训练集只评估原始预测，不应用规则（规则主要用于测试/验证）
+            train_results = self.predictor.evaluate(y_train, y_train_pred, y_pred_proba=y_train_pred_proba)
+            
+            # 5.2 验证集评估
+            self.log("\n[验证集评估]")
             y_val_pred_proba = self.predictor.predict_proba(X_val)
             y_val_pred = np.argmax(y_val_pred_proba, axis=1)
             y_val_pred_corrected = self.predictor.apply_rules(val_df, y_val_pred, y_val_pred_proba)
-            val_results = self.predictor.evaluate(y_val, y_val_pred, y_val_pred_corrected)
+            val_results = self.predictor.evaluate(y_val, y_val_pred, y_val_pred_corrected, y_pred_proba=y_val_pred_proba)
             
             # 显示结果
             result_text = "="*60 + "\n"
-            result_text += "验证集评估结果\n"
+            result_text += "模型评估结果\n"
             result_text += "="*60 + "\n\n"
-            result_text += "[原始预测]\n"
-            result_text += f"准确率: {val_results['accuracy']:.4f}\n"
-            result_text += f"F1分数 (macro): {val_results['f1_macro']:.4f}\n\n"
+            
+            result_text += "[训练集]\n"
+            result_text += f"Accuracy: {train_results['accuracy']:.4f}\n"
+            result_text += f"F1-Score (macro): {train_results['f1_macro']:.4f}\n"
+            if 'log_loss' in train_results:
+                result_text += f"Log Loss: {train_results['log_loss']:.4f}\n"
+            result_text += "\n"
+            
+            result_text += "[验证集 - 原始预测]\n"
+            result_text += f"Accuracy: {val_results['accuracy']:.4f}\n"
+            result_text += f"F1-Score (macro): {val_results['f1_macro']:.4f}\n"
+            if 'log_loss' in val_results:
+                result_text += f"Log Loss: {val_results['log_loss']:.4f}\n"
+            result_text += "\n"
             
             if 'accuracy_corrected' in val_results:
-                result_text += "[规则修正后]\n"
-                result_text += f"准确率: {val_results['accuracy_corrected']:.4f}\n"
-                result_text += f"F1分数 (macro): {val_results['f1_macro_corrected']:.4f}\n"
+                result_text += "[验证集 - 规则修正后]\n"
+                result_text += f"Accuracy: {val_results['accuracy_corrected']:.4f}\n"
+                result_text += f"F1-Score (macro): {val_results['f1_macro_corrected']:.4f}\n"
                 result_text += f"改进: {val_results['accuracy_corrected']-val_results['accuracy']:+.4f}\n"
             
             self.result_text.insert(tk.END, result_text)
@@ -1202,9 +1214,7 @@ class TrainingGUI:
             self.log("\n6. 保存中间结果...")
             self.status_var.set("保存中间结果...")
             
-            # Predict on training set
-            y_train_pred_proba = self.predictor.predict_proba(X_train)
-            y_train_pred = np.argmax(y_train_pred_proba, axis=1)
+            # Apply rules for training set for saving (calculated above)
             y_train_pred_corrected = self.predictor.apply_rules(train_df, y_train_pred, y_train_pred_proba)
             
             # Define memory directory
@@ -1213,6 +1223,12 @@ class TrainingGUI:
             
             self.predictor.save_results_by_well(train_df, y_train_pred, y_train_pred_corrected, os.path.join(memory_dir, "train"))
             self.predictor.save_results_by_well(val_df, y_val_pred, y_val_pred_corrected, os.path.join(memory_dir, "test"))
+            
+            # 保存混淆矩阵
+            self.log("6.1. 保存混淆矩阵...")
+            test_dir = os.path.join(memory_dir, "test")
+            self.predictor.save_confusion_matrix(y_val, y_val_pred, test_dir, "confusion_matrix_val_origin")
+            self.predictor.save_confusion_matrix(y_val, y_val_pred_corrected, test_dir, "confusion_matrix_val_corrected")
             
             self.log(f"中间结果已保存到 {memory_dir}")
             
@@ -1224,7 +1240,7 @@ class TrainingGUI:
 
             # 7. 保存模型
             self.log("\n7. 保存模型...")
-            self.predictor.save_model(filename="well_status_xgboost.json", params=params)
+            self.predictor.save_model(params=params)
             
             self.log("\n" + "="*60)
             self.log("训练完成！")
@@ -1237,10 +1253,10 @@ class TrainingGUI:
             
         except Exception as e:
             self.log(f"\n错误: {str(e)}")
-            import traceback
-            self.log(traceback.format_exc())
             messagebox.showerror("错误", f"训练过程中出现错误:\n{str(e)}")
             self.status_var.set("训练失败")
+            import traceback
+            traceback.print_exc()
         
         finally:
             # 重新启用训练按钮
@@ -1252,7 +1268,7 @@ class TrainingGUI:
         # 1. 选择模型文件
         model_path = filedialog.askopenfilename(
             title="选择训练好的模型文件",
-            filetypes=[("Model files", "*.json"), ("All files", "*.*")],
+            filetypes=[("XGBoost Model", "*.json"), ("All files", "*.*")],
             initialdir="Models" if os.path.exists("Models") else os.getcwd()
         )
         
@@ -1274,7 +1290,7 @@ class TrainingGUI:
             title="保存预测结果",
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            initialfile=os.path.basename(data_path).replace('.csv', '_xgboost_predictions.csv')
+            initialfile=os.path.basename(data_path).replace('.csv', '_predictions.csv')
         )
         
         if not output_path:
@@ -1294,7 +1310,7 @@ class TrainingGUI:
             self.status_var.set("预测中...")
             
             self.log("\n" + "="*60)
-            self.log("开始预测 (XGBoost)")
+            self.log("开始预测")
             self.log("="*60)
             self.log(f"\n模型文件: {model_path}")
             self.log(f"数据文件: {data_path}")
@@ -1367,6 +1383,13 @@ class TrainingGUI:
             self.predictor.save_results_by_well(df, y_pred, y_pred_corrected, predict_dir)
             self.log(f"   ✓ 分井结果已保存到: {predict_dir}")
             
+            # 7.6 保存混淆矩阵 (如果有真实标签)
+            if 'status' in df.columns:
+                self.log("\n7.6 保存混淆矩阵...")
+                y_true = df['status'].values
+                self.predictor.save_confusion_matrix(y_true, y_pred, predict_dir, "confusion_matrix_pred_origin")
+                self.predictor.save_confusion_matrix(y_true, y_pred_corrected, predict_dir, "confusion_matrix_pred_corrected")
+            
             # 显示预测结果统计
             self.log("\n预测结果统计:")
             status_counts = pd.Series(y_pred_corrected).value_counts().sort_index()
@@ -1394,6 +1417,14 @@ class TrainingGUI:
 
 def main():
     """主函数"""
+    try:
+        import xgboost
+    except ImportError:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("错误", "未检测到 xgboost 库。\n请运行 pip install xgboost 安装。")
+        return
+
     root = tk.Tk()
     app = TrainingGUI(root)
     root.mainloop()
