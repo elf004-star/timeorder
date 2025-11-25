@@ -775,6 +775,9 @@ class WellStatusPredictor:
         
         # 获取特征重要性 (sklearn GBM使用feature_importances_)
         feature_importance = self.model.feature_importances_
+        # 归一化特征重要性 (统一为0-1之间)
+        if feature_importance.sum() > 0:
+            feature_importance = feature_importance / feature_importance.sum()
         
         # 创建DataFrame
         importance_df = pd.DataFrame({
@@ -793,15 +796,55 @@ class WellStatusPredictor:
         print(f"特征重要性CSV已保存到: {csv_path}")
         
         # Generate chart - Top 10
-        plt.figure(figsize=(10, 6))
-        top10 = importance_df.head(10)
-        plt.barh(range(len(top10)), top10['importance'].values, color='steelblue')
-        plt.yticks(range(len(top10)), top10['feature'].values, fontsize=11)
-        plt.xticks(fontsize=11)
-        plt.xlabel('Feature Importance', fontsize=14)
-        plt.ylabel('Feature Name', fontsize=14)
-        plt.title('Top 10 Feature Importances', fontsize=14, fontweight='bold')
-        plt.gca().invert_yaxis()  # Important ones at the top
+        plt.figure(figsize=(12, 8))
+        # Sort for plotting (smallest at bottom for barh)
+        top10 = importance_df.head(10).iloc[::-1]
+        
+        # Custom Palette: Dark Blue -> Red
+        from matplotlib.colors import LinearSegmentedColormap
+        hex_colors = ['#4B74B2', '#90BEDE', '#E6F1F3', '#FFDF92', '#FC8C5A', '#DB3124']
+        cmap = LinearSegmentedColormap.from_list("custom_palette", hex_colors, N=10)
+        colors = [cmap(i) for i in range(10)]
+        
+        bars = plt.barh(range(len(top10)), top10['importance'].values, color=colors)
+        
+        # Font sizes
+        font_size = 16
+        
+        plt.yticks(range(len(top10)), top10['feature'].values, fontsize=font_size)
+        plt.xticks(fontsize=font_size)
+        plt.xlabel('Feature Importance', fontsize=font_size)
+        plt.ylabel('Feature Name', fontsize=font_size)
+        plt.title('Top 10 Feature Importances', fontsize=font_size, fontweight='bold')
+        
+        # Specific features to highlight
+        special_features = ['dogl_s_cumsum', 'dist_to_max', 'accum_ratio', 'dogl_s_mean_5']
+        
+        for i, bar in enumerate(bars):
+            # top10 is reversed, so last one (index len-1) is Rank 1
+            rank = len(top10) - 1 - i # 0-based rank (0 is best)
+            feature_name = top10.iloc[i]['feature']
+            importance_val = top10.iloc[i]['importance']
+            
+            # Condition: Top 3 or in special list
+            if rank < 3 or feature_name in special_features:
+                # Text color based on luminance
+                r, g, b, _ = bar.get_facecolor()
+                luminance = 0.299*r + 0.587*g + 0.114*b
+                text_color = 'black' if luminance > 0.6 else 'white'
+                
+                # Display name in histogram
+                plt.text(
+                    importance_val / 2, 
+                    bar.get_y() + bar.get_height()/2,
+                    feature_name,
+                    ha='center', 
+                    va='center',
+                    color=text_color,
+                    fontsize=font_size, 
+                    fontweight='bold'
+                )
+        
         plt.tight_layout()
         top10_path = os.path.join(features_dir, "feature_importance_top10.png")
         plt.savefig(top10_path, dpi=300, bbox_inches='tight')
